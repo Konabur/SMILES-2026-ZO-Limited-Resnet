@@ -62,7 +62,7 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-5,
+        lr: float = 5e-5,
         eps: float = 1e-3,
         perturbation_mode: str = "rademacher",
         momentum: float = 0.5,
@@ -99,7 +99,6 @@ class ZeroOrderOptimizer:
         self.layer_names: list[str] = [
             "layer4.1.bn1.weight", "layer4.1.bn1.bias",
             "layer4.1.bn2.weight", "layer4.1.bn2.bias",
-            "fc.weight", "fc.bias",
         ]
         # ------------------------------------------------------------------
 
