@@ -62,20 +62,24 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-2,
+        lr: float = 5e-4,
         eps: float = 1e-3,
-        perturbation_mode: str = "gaussian",
-        momentum: float = 0.9,
+        perturbation_mode: str = "rademacher",
+        momentum: float = 0.5,
+        n_samples: int = 2,
+        grad_clip: float = 1.0,
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
         self.momentum = momentum
+        self.n_samples = n_samples
+        self.grad_clip = grad_clip
 
-        if perturbation_mode not in ("gaussian", "uniform"):
+        if perturbation_mode not in ("gaussian", "uniform", "rademacher"):
             raise ValueError(
-                f"perturbation_mode must be 'gaussian' or 'uniform', "
-                f"got '{perturbation_mode}'"
+                f"perturbation_mode must be 'gaussian', 'uniform', or "
+                f"'rademacher', got '{perturbation_mode}'"
             )
         self.perturbation_mode = perturbation_mode
 
@@ -131,6 +135,10 @@ class ZeroOrderOptimizer:
         Returns:
             A tensor of the same shape as ``param``, normalised to unit L2 norm.
         """
+        if self.perturbation_mode == "rademacher":
+            # ±1 per element, no normalization — classic SPSA direction.
+            return torch.randint(0, 2, param.shape, device=param.device,
+                                 dtype=param.dtype) * 2 - 1
         if self.perturbation_mode == "gaussian":
             u = torch.randn_like(param)
         else:  # uniform
@@ -173,28 +181,33 @@ class ZeroOrderOptimizer:
         Student task:
             Replace this with a more efficient or accurate estimator:
         """
-        # SPSA: perturb all active parameters simultaneously with a single
-        # random direction per parameter, then estimate the directional
-        # derivative from exactly two forward passes regardless of how many
-        # parameters are active.
-        directions: dict[str, torch.Tensor] = {
-            name: self._sample_direction(param) for name, param in params.items()
+        # SPSA averaged over n_samples random directions. Each direction
+        # costs exactly 2 forward passes regardless of how many parameters
+        # are active. Averaging reduces variance by ~1/sqrt(n_samples).
+        grads: dict[str, torch.Tensor] = {
+            name: torch.zeros_like(param) for name, param in params.items()
         }
 
         with torch.no_grad():
-            for name, param in params.items():
-                param.data.add_(directions[name], alpha=self.eps)
-            f_plus = loss_fn()
+            for _ in range(self.n_samples):
+                directions = {
+                    name: self._sample_direction(p) for name, p in params.items()
+                }
 
-            for name, param in params.items():
-                param.data.add_(directions[name], alpha=-2.0 * self.eps)
-            f_minus = loss_fn()
+                for name, p in params.items():
+                    p.data.add_(directions[name], alpha=self.eps)
+                f_plus = loss_fn()
 
-            for name, param in params.items():
-                param.data.add_(directions[name], alpha=self.eps)
+                for name, p in params.items():
+                    p.data.add_(directions[name], alpha=-2.0 * self.eps)
+                f_minus = loss_fn()
 
-            scale = (f_plus - f_minus) / (2.0 * self.eps)
-            grads = {name: scale * u for name, u in directions.items()}
+                for name, p in params.items():
+                    p.data.add_(directions[name], alpha=self.eps)
+
+                scale = (f_plus - f_minus) / (2.0 * self.eps * self.n_samples)
+                for name, u in directions.items():
+                    grads[name].add_(u, alpha=scale)
 
         return grads
         # ------------------------------------------------------------------
@@ -221,8 +234,13 @@ class ZeroOrderOptimizer:
               - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
         """
         with torch.no_grad():
+            # Global gradient-norm clipping across all active params.
+            total_sq = sum(g.pow(2).sum() for g in grads.values())
+            total_norm = total_sq.sqrt()
+            clip_coef = (self.grad_clip / (total_norm + 1e-12)).clamp(max=1.0)
+
             for name, param in params.items():
-                g = grads[name]
+                g = grads[name] * clip_coef
                 v = self._velocity.get(name)
                 if v is None or v.shape != g.shape:
                     v = torch.zeros_like(g)
