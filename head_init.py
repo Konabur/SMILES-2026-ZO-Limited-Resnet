@@ -6,8 +6,6 @@ features extracted from a CIFAR100 train subset, then copies the result
 into the new 100-class head. No gradients of the backbone are computed.
 """
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +20,6 @@ _PROBE_SAMPLES = 4096
 _PROBE_BATCH = 64
 _RIDGE_LAMBDA = 1.0
 _DATA_DIR = "./data"
-_CACHE_PATH = os.path.join(_DATA_DIR, "head_probe.pt")
 
 
 def _extract_features(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -60,29 +57,21 @@ def init_last_layer(layer: nn.Linear) -> None:
     the one-hot label matrix. The bias absorbs the means of X and Y so the
     solution is centred.
     """
-    if os.path.exists(_CACHE_PATH):
-        cached = torch.load(_CACHE_PATH, map_location="cpu")
-        W_t, b = cached["weight"], cached["bias"]
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        X, y = _extract_features(device)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X, y = _extract_features(device)
 
-        Y = F.one_hot(y, _NUM_CLASSES).float()
-        x_mean = X.mean(dim=0, keepdim=True)
-        y_mean = Y.mean(dim=0, keepdim=True)
-        Xc = X - x_mean
-        Yc = Y - y_mean
+    Y = F.one_hot(y, _NUM_CLASSES).float()
+    x_mean = X.mean(dim=0, keepdim=True)
+    y_mean = Y.mean(dim=0, keepdim=True)
+    Xc = X - x_mean
+    Yc = Y - y_mean
 
-        feat_dim = X.shape[1]
-        A = Xc.T @ Xc + _RIDGE_LAMBDA * torch.eye(feat_dim)
-        B = Xc.T @ Yc
-        W = torch.linalg.solve(A, B)
-        b = (y_mean - x_mean @ W).squeeze(0)
-        W_t = W.T.contiguous()
-
-        os.makedirs(_DATA_DIR, exist_ok=True)
-        torch.save({"weight": W_t, "bias": b}, _CACHE_PATH)
+    feat_dim = X.shape[1]
+    A = Xc.T @ Xc + _RIDGE_LAMBDA * torch.eye(feat_dim)
+    B = Xc.T @ Yc
+    W = torch.linalg.solve(A, B)
+    b = (y_mean - x_mean @ W).squeeze(0)
 
     with torch.no_grad():
-        layer.weight.copy_(W_t.to(layer.weight.device, layer.weight.dtype))
+        layer.weight.copy_(W.T.to(layer.weight.device, layer.weight.dtype))
         layer.bias.copy_(b.to(layer.bias.device, layer.bias.dtype))

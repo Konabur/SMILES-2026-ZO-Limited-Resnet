@@ -62,19 +62,19 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 2e-3,
+        lr: float = 1e-5,
         eps: float = 1e-3,
         perturbation_mode: str = "rademacher",
         momentum: float = 0.5,
         n_samples: int = 2,
-        grad_clip: float = 1.0,
+        scale_clip: float = 10.0,
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
         self.momentum = momentum
         self.n_samples = n_samples
-        self.grad_clip = grad_clip
+        self.scale_clip = scale_clip
 
         if perturbation_mode not in ("gaussian", "uniform", "rademacher"):
             raise ValueError(
@@ -96,7 +96,11 @@ class ZeroOrderOptimizer:
         # You can also update self.layer_names inside .step() to implement
         # a dynamic schedule (e.g. gradually unfreeze deeper layers).
         # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
+        self.layer_names: list[str] = [
+            "layer4.1.bn1.weight", "layer4.1.bn1.bias",
+            "layer4.1.bn2.weight", "layer4.1.bn2.bias",
+            "fc.weight", "fc.bias",
+        ]
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -205,7 +209,9 @@ class ZeroOrderOptimizer:
                 for name, p in params.items():
                     p.data.add_(directions[name], alpha=self.eps)
 
-                scale = (f_plus - f_minus) / (2.0 * self.eps * self.n_samples)
+                raw = (f_plus - f_minus) / (2.0 * self.eps)
+                scale = max(-self.scale_clip, min(self.scale_clip, raw))
+                scale /= self.n_samples
                 for name, u in directions.items():
                     grads[name].add_(u, alpha=scale)
 
@@ -234,13 +240,8 @@ class ZeroOrderOptimizer:
               - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
         """
         with torch.no_grad():
-            # Global gradient-norm clipping across all active params.
-            total_sq = sum(g.pow(2).sum() for g in grads.values())
-            total_norm = total_sq.sqrt()
-            clip_coef = (self.grad_clip / (total_norm + 1e-12)).clamp(max=1.0)
-
             for name, param in params.items():
-                g = grads[name] * clip_coef
+                g = grads[name]
                 v = self._velocity.get(name)
                 if v is None or v.shape != g.shape:
                     v = torch.zeros_like(g)
