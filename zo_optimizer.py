@@ -62,13 +62,15 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
+        lr: float = 1e-2,
         eps: float = 1e-3,
         perturbation_mode: str = "gaussian",
+        momentum: float = 0.9,
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
+        self.momentum = momentum
 
         if perturbation_mode not in ("gaussian", "uniform"):
             raise ValueError(
@@ -76,6 +78,9 @@ class ZeroOrderOptimizer:
                 f"got '{perturbation_mode}'"
             )
         self.perturbation_mode = perturbation_mode
+
+        # Momentum buffers, lazily allocated per parameter name.
+        self._velocity: dict[str, torch.Tensor] = {}
 
         # ------------------------------------------------------------------
         # STUDENT: Set self.layer_names to the parameters you want to tune.
@@ -168,28 +173,28 @@ class ZeroOrderOptimizer:
         Student task:
             Replace this with a more efficient or accurate estimator:
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the gradient estimation below.
-        # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
+        # SPSA: perturb all active parameters simultaneously with a single
+        # random direction per parameter, then estimate the directional
+        # derivative from exactly two forward passes regardless of how many
+        # parameters are active.
+        directions: dict[str, torch.Tensor] = {
+            name: self._sample_direction(param) for name, param in params.items()
+        }
 
         with torch.no_grad():
             for name, param in params.items():
-                u = self._sample_direction(param)
+                param.data.add_(directions[name], alpha=self.eps)
+            f_plus = loss_fn()
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+            for name, param in params.items():
+                param.data.add_(directions[name], alpha=-2.0 * self.eps)
+            f_minus = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
+            for name, param in params.items():
+                param.data.add_(directions[name], alpha=self.eps)
 
-                # Restore original value
-                param.data.add_(self.eps * u)
-
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+            scale = (f_plus - f_minus) / (2.0 * self.eps)
+            grads = {name: scale * u for name, u in directions.items()}
 
         return grads
         # ------------------------------------------------------------------
@@ -215,13 +220,15 @@ class ZeroOrderOptimizer:
               - Adam-style: maintain first and second moment estimates.
               - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the parameter update below.
-        # ------------------------------------------------------------------
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
-        # ------------------------------------------------------------------
+                g = grads[name]
+                v = self._velocity.get(name)
+                if v is None or v.shape != g.shape:
+                    v = torch.zeros_like(g)
+                v.mul_(self.momentum).add_(g)
+                self._velocity[name] = v
+                param.data.add_(v, alpha=-self.lr)
 
     # ------------------------------------------------------------------
     # Public API
